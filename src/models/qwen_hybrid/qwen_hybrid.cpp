@@ -232,8 +232,7 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
             for (uint32_t req = 0; req < nreq; req++) {
                 auto seq_len = req_lens[req];
                 auto conv_state = mamba_caches[req]->conv_states[idev][linear_cache_layer];
-                // auto recurrent_state = mamba_caches[req]->ssm_states[idev][linear_cache_layer];
-                auto recurrent_state = mamba_caches[req]->ssm_states[idev][layer];
+                auto recurrent_state = mamba_caches[req]->ssm_states[idev][linear_cache_layer];
 
                 // slice out qkv of current req and reshape to conv1d input
                 auto mixed_qkv = Tensor::buffer(dt_logits, {key_dim * 2 + value_dim, conv_kernel_dim - 1 + seq_len}, rsrc.memory_pool);
@@ -241,10 +240,19 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
                                         ->view({ntok, num_k_heads, (key_dim * 2 + value_dim * 2) / num_k_heads})
                                         ->slice({{0, token_offset, seq_len}, {2, 0, (key_dim * 2 + value_dim) / num_k_heads}})
                                         ->permute({1, 2, 0});
-                auto mixed_qkv_reorder = mixed_qkv->slice(1, conv_kernel_dim - 1, seq_len)->view({num_k_heads, (key_dim * 2 + value_dim) / num_k_heads, seq_len});
-                rearrange(mixed_qkv_reorder->slice(1, 0, head_k_dim), qkvz_reorder->slice({{1, 0, head_k_dim}}));
-                rearrange(mixed_qkv_reorder->slice(1, head_k_dim, head_k_dim), qkvz_reorder->slice(1, head_k_dim, head_k_dim));
-                rearrange(mixed_qkv_reorder->slice(1, head_k_dim * 2, value_dim / num_k_heads), qkvz_reorder->slice(1, head_k_dim * 2, value_dim / num_k_heads));
+                auto mixed_qkv_reorder = mixed_qkv->slice(1, conv_kernel_dim - 1, seq_len);
+                rearrange(mixed_qkv_reorder
+                              ->slice(0, 0, key_dim)
+                              ->view({num_k_heads, key_dim / num_k_heads, seq_len}),
+                          qkvz_reorder->slice({{1, 0, head_k_dim}}));
+                rearrange(mixed_qkv_reorder
+                              ->slice(0, key_dim, key_dim)
+                              ->view({num_k_heads, key_dim / num_k_heads, seq_len}),
+                          qkvz_reorder->slice(1, head_k_dim, head_k_dim));
+                rearrange(mixed_qkv_reorder
+                              ->slice(0, 2 * key_dim, value_dim)
+                              ->view({num_k_heads, value_dim / num_k_heads, seq_len}),
+                          qkvz_reorder->slice(1, head_k_dim * 2, value_dim / num_k_heads));
 
                 // concat previous conv state as padding
                 rearrange(mixed_qkv->slice(1, 0, conv_kernel_dim - 1),
@@ -257,87 +265,65 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
                 silu(mixed_qkv_out, mixed_qkv_out);
 
                 // q k v z
-                size_t batch_size = 1;
-                auto query = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
-                auto key = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
-                auto value = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
+                auto query = Tensor::buffer(dt_logits, {1, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
+                auto key = Tensor::buffer(dt_logits, {1, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
+                auto value = Tensor::buffer(dt_logits, {1, num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
                 // transpose to {seq_len, key_dim * 2 + value_dim}
                 mixed_qkv_out = mixed_qkv_out->view({key_dim * 2 + value_dim, seq_len});
                 // broadcast num_qk_heads to num_v_heads
-                std::cout << "mixed_qkv_out->shape(): " << mixed_qkv_out->shape().size() << std::endl;
-                rearrange(query,
+                rearrange(query->view({num_k_heads, num_v_heads / num_k_heads, seq_len, head_k_dim}),
                           mixed_qkv_out
                               ->slice(0, 0, key_dim)
                               ->view({num_k_heads, head_k_dim, seq_len})
                               ->permute({0, 2, 1})
-                              ->insertBroadcastDim(1, num_v_heads / num_k_heads)
-                              ->view({batch_size, num_v_heads, seq_len}));
-                std::cout << "query->shape(): " << mixed_qkv_out->shape().size() << std::endl;
-                rearrange(key,
+                              ->insertBroadcastDim(1, num_v_heads / num_k_heads));
+                rearrange(key->view({num_k_heads, num_v_heads / num_k_heads, seq_len, head_k_dim}),
                           mixed_qkv_out
                               ->slice(0, key_dim, key_dim)
                               ->view({num_k_heads, head_k_dim, seq_len})
                               ->permute({0, 2, 1})
-                              ->insertBroadcastDim(1, num_v_heads / num_k_heads)
-                              ->insertBroadcastDim(0, batch_size));
-                std::cout << "key->shape(): " << mixed_qkv_out->shape().size() << std::endl;
-                
-                rearrange(value,
+                              ->insertBroadcastDim(1, num_v_heads / num_k_heads));
+                rearrange(value->view({num_v_heads, seq_len, head_v_dim}),
                           mixed_qkv_out
                               ->slice(0, key_dim * 2, value_dim)
                               ->view({num_v_heads, head_v_dim, seq_len})
-                              ->permute({0, 2, 1})
-                              ->insertBroadcastDim(0, batch_size));
-                std::cout << "value->shape(): " << mixed_qkv_out->shape().size() << std::endl;
+                              ->permute({0, 2, 1}));
                 // get beta and g
-                // auto beta = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
-                // auto g = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
+                auto beta = Tensor::buffer(dt_logits, {num_v_heads, seq_len}, rsrc.memory_pool);
+                auto g = Tensor::buffer(dt_logits, {num_v_heads, seq_len}, rsrc.memory_pool);
+                rearrange(beta->view({num_k_heads, num_v_heads / num_k_heads, seq_len}), b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0}));
+                rearrange(g->view({num_k_heads, num_v_heads / num_k_heads, seq_len}), a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0}));
 
-                auto beta = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
-                auto g = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
-                // rearrange(beta, b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
-                // rearrange(g, a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
-                rearrange(beta->view({batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len}), b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
-                rearrange(g->view({batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len}), a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
-                std::cout << "beta->shape(): " << beta->shape().size() << std::endl;
+                auto linear_attn_out = Tensor::buffer(dt_logits, {num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
 
-                auto linear_attn_out = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
-                auto linear_attn_out_T = Tensor::buffer(dt_logits, {batch_size, seq_len, num_v_heads, head_v_dim}, rsrc.memory_pool);
-                bool is_prefill = (seq_len != 1);
-                // auto recurrent_state_layer = recurrent_state[layer]; 
-                /// TODO: gated delta rule  
-                if (is_prefill) {
+                if (seq_len > 1) {
+                    size_t chunk_size = 8;
                     chunk_gated_delta_rule(
-                        linear_attn_out,
-                        recurrent_state,
+                        linear_attn_out->view({1, num_v_heads, seq_len, head_v_dim}),
+                        recurrent_state->view({1, num_v_heads, head_k_dim, head_v_dim}),
                         query,
                         key,
                         value,
-                        g,
-                        beta,
-                        nullptr,
+                        g->view({1, num_v_heads, seq_len}),
+                        beta->view({1, num_v_heads, seq_len}),
+                        recurrent_state->view({1, num_v_heads, head_k_dim, head_v_dim}),
                         true,
-                        8
-                    );
-                    
+                        chunk_size);
                 } else {
                     recurrent_gated_delta_rule(
-                        linear_attn_out,
-                        recurrent_state,
+                        linear_attn_out->view({1, num_v_heads, seq_len, head_v_dim}),
+                        recurrent_state->view({1, num_v_heads, head_k_dim, head_v_dim}),
                         query,
                         key,
                         value,
-                        g,
-                        beta,
-                        recurrent_state,
-                        true
-                    );
+                        g->view({1, num_v_heads, seq_len}),
+                        beta->view({1, num_v_heads, seq_len}),
+                        recurrent_state->view({1, num_v_heads, head_k_dim, head_v_dim}),
+                        true);
                 }
 
-                // TODO: remove linear_attn_out_T 
-                // std::cout << "linear_attn_out: " << linear_attn_out->shape().size() << std::endl;
-                rearrange(linear_attn_out_T, linear_attn_out->permute({0, 2, 1, 3}));
-                rearrange(linear_attn_o_buf->slice(0, token_offset, seq_len), linear_attn_out_T->view({seq_len, value_dim}));
+                rearrange(linear_attn_o_buf->slice(0, token_offset, seq_len)->view({seq_len, num_v_heads, head_v_dim}),
+                          linear_attn_out->permute({1, 0, 2}));
 
                 token_offset += seq_len;
             }
