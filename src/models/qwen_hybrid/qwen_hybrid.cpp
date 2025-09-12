@@ -258,19 +258,21 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
 
                 // q k v z
                 size_t batch_size = 1;
-                auto query = Tensor::buffer(dt_logits, {batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len, head_k_dim}, rsrc.memory_pool);
-                auto key = Tensor::buffer(dt_logits, {batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len, head_k_dim}, rsrc.memory_pool);
+                auto query = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
+                auto key = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_k_dim}, rsrc.memory_pool);
                 auto value = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
                 // transpose to {seq_len, key_dim * 2 + value_dim}
                 mixed_qkv_out = mixed_qkv_out->view({key_dim * 2 + value_dim, seq_len});
                 // broadcast num_qk_heads to num_v_heads
+                std::cout << "mixed_qkv_out->shape(): " << mixed_qkv_out->shape().size() << std::endl;
                 rearrange(query,
                           mixed_qkv_out
                               ->slice(0, 0, key_dim)
                               ->view({num_k_heads, head_k_dim, seq_len})
                               ->permute({0, 2, 1})
                               ->insertBroadcastDim(1, num_v_heads / num_k_heads)
-                              ->insertBroadcastDim(0, batch_size));
+                              ->view({batch_size, num_v_heads, seq_len}));
+                std::cout << "query->shape(): " << mixed_qkv_out->shape().size() << std::endl;
                 rearrange(key,
                           mixed_qkv_out
                               ->slice(0, key_dim, key_dim)
@@ -278,22 +280,26 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
                               ->permute({0, 2, 1})
                               ->insertBroadcastDim(1, num_v_heads / num_k_heads)
                               ->insertBroadcastDim(0, batch_size));
+                std::cout << "key->shape(): " << mixed_qkv_out->shape().size() << std::endl;
+                
                 rearrange(value,
                           mixed_qkv_out
                               ->slice(0, key_dim * 2, value_dim)
                               ->view({num_v_heads, head_v_dim, seq_len})
                               ->permute({0, 2, 1})
                               ->insertBroadcastDim(0, batch_size));
+                std::cout << "value->shape(): " << mixed_qkv_out->shape().size() << std::endl;
                 // get beta and g
                 // auto beta = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
                 // auto g = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
-                // rearrange(beta->view({num_k_heads, num_v_heads / num_k_heads, seq_len}), b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0}));
-                // rearrange(g->view({num_k_heads, num_v_heads / num_k_heads, seq_len}), a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0}));
 
                 auto beta = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
                 auto g = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len}, rsrc.memory_pool);
-                rearrange(beta, b_buf->slice(0, token_offset, seq_len)->permute({1, 0})->insertBroadcastDim(0, batch_size));
-                rearrange(g, a_buf->slice(0, token_offset, seq_len)->permute({1, 0})->insertBroadcastDim(0, batch_size));
+                // rearrange(beta, b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
+                // rearrange(g, a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
+                rearrange(beta->view({batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len}), b_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
+                rearrange(g->view({batch_size, num_k_heads, num_v_heads / num_k_heads, seq_len}), a_buf->slice(0, token_offset, seq_len)->permute({1, 2, 0})->insertBroadcastDim(0, batch_size));
+                std::cout << "beta->shape(): " << beta->shape().size() << std::endl;
 
                 auto linear_attn_out = Tensor::buffer(dt_logits, {batch_size, num_v_heads, seq_len, head_v_dim}, rsrc.memory_pool);
                 auto linear_attn_out_T = Tensor::buffer(dt_logits, {batch_size, seq_len, num_v_heads, head_v_dim}, rsrc.memory_pool);
@@ -304,11 +310,11 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
                     chunk_gated_delta_rule(
                         linear_attn_out,
                         recurrent_state,
-                        query->view({batch_size, num_v_heads, seq_len, head_k_dim}),
-                        key->view({batch_size, num_v_heads, seq_len, head_k_dim}),
-                        value->view({batch_size, num_v_heads, seq_len, head_v_dim}),
-                        g->view({batch_size, num_v_heads, seq_len}),
-                        beta->view({batch_size, num_v_heads, seq_len}),
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
                         nullptr,
                         true,
                         8
@@ -318,17 +324,18 @@ void inferDeviceBatch(const QwenHybridMeta *meta, DeviceResource &rsrc,
                     recurrent_gated_delta_rule(
                         linear_attn_out,
                         recurrent_state,
-                        query->view({batch_size, num_v_heads, seq_len, head_k_dim}),
-                        key->view({batch_size, num_v_heads, seq_len, head_k_dim}),
-                        value->view({batch_size, num_v_heads, seq_len, head_v_dim}),
-                        g->view({batch_size, num_v_heads, seq_len}),
-                        beta->view({batch_size, num_v_heads, seq_len}),
+                        query,
+                        key,
+                        value,
+                        g,
+                        beta,
                         recurrent_state,
                         true
                     );
                 }
 
                 // TODO: remove linear_attn_out_T 
+                // std::cout << "linear_attn_out: " << linear_attn_out->shape().size() << std::endl;
                 rearrange(linear_attn_out_T, linear_attn_out->permute({0, 2, 1, 3}));
                 rearrange(linear_attn_o_buf->slice(0, token_offset, seq_len), linear_attn_out_T->view({seq_len, value_dim}));
 
