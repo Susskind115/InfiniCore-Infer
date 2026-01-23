@@ -29,3 +29,6 @@ __pycache__/
 *.txt
 
 *.http
+
+# codex
+test/codex_coding/
