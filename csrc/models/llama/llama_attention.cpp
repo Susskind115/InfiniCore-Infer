@@ -7,7 +7,9 @@
 #include "infinicore/ops/mul.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -16,6 +18,30 @@
 #include <vector>
 
 namespace infinilm::models::llama {
+
+static bool env_bool(const char *name) {
+    const char *env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+    return (std::strcmp(env, "1") == 0) || (std::strcmp(env, "true") == 0);
+}
+
+static bool use_flash_attention_decode() {
+    const char *env = std::getenv("INFINILM_ATTN_IMPL");
+    // v0.4: default-enable flash attention decode when available.
+    // Users can force paged decode via INFINILM_ATTN_IMPL=paged.
+    if (env == nullptr) return true;
+    return std::strcmp(env, "flash") == 0;
+}
+
+static bool use_flash_attention_prefill() {
+    const char *env = std::getenv("INFINILM_ATTN_PREFILL_IMPL");
+    // v0.4: default-enable flash attention prefill when available.
+    // Users can force paged prefill via INFINILM_ATTN_PREFILL_IMPL=paged.
+    if (env == nullptr) return true;
+    return std::strcmp(env, "flash") == 0;
+}
 
 LlamaAttention::LlamaAttention(const LlamaConfig &config,
                                const infinicore::Device &device,
@@ -148,6 +174,7 @@ infinicore::Tensor LlamaAttention::forward_paged_(const infinicore::Tensor &hidd
                                                   std::optional<infinicore::Tensor> slot_mapping) const {
     ASSERT(block_tables.has_value());
     ASSERT(slot_mapping.has_value());
+    
 
     // Input shape: [batch, seq_len, hidden_size]
     auto hidden_states_mutable = hidden_states;
@@ -199,27 +226,85 @@ infinicore::Tensor LlamaAttention::forward_paged_(const infinicore::Tensor &hidd
     infinicore::Tensor attn_output = infinicore::Tensor::empty({seq_len, num_attention_heads_, head_dim_}, q_reshaped->dtype(), q_reshaped->device());
 
     if (is_prefill) {
-        infinicore::op::paged_attention_prefill_(
-            attn_output,
-            q_reshaped,
-            k_total,
-            v_total,
-            block_tables.value(),
-            total_sequence_lengths.value(),
-            input_offsets.value(),
-            std::nullopt,
-            scaling_);
+        const bool want_flash_prefill = use_flash_attention_prefill();
+        const size_t block_size = k_total->size(2);
+
+        if (env_bool("INFINILM_DEBUG_ATTN_DISPATCH") && rank_info_.tp_rank == 0 && layer_idx_ == 0) {
+            static std::atomic<bool> printed_prefill{false};
+            if (!printed_prefill.exchange(true)) {
+                fprintf(stderr,
+                        "[INFINILM][llama_attention] prefill dispatch: want_flash=%d block_size=%zu heads=%zu kv_heads=%zu head_dim=%zu tp_rank=%d tp_size=%d\n",
+                        static_cast<int>(want_flash_prefill), block_size,
+                        static_cast<size_t>(num_attention_heads_), static_cast<size_t>(num_key_value_heads_),
+                        static_cast<size_t>(head_dim_), rank_info_.tp_rank, rank_info_.tp_size);
+            }
+        }
+
+        if (want_flash_prefill) {
+            infinicore::op::flash_attention_prefill_(
+                attn_output,
+                q_reshaped,
+                k_total,
+                v_total,
+                block_tables.value(),
+                total_sequence_lengths.value(),
+                input_offsets.value(),
+                std::nullopt,
+                scaling_);
+        } else {
+            infinicore::op::paged_attention_prefill_(
+                attn_output,
+                q_reshaped,
+                k_total,
+                v_total,
+                block_tables.value(),
+                total_sequence_lengths.value(),
+                input_offsets.value(),
+                std::nullopt,
+                scaling_);
+        }
 
     } else {
-        infinicore::op::paged_attention_(
-            attn_output,
-            q_reshaped,
-            k_total,
-            v_total,
-            block_tables.value(),
-            total_sequence_lengths.value(),
-            std::nullopt,
-            scaling_);
+        const bool want_flash_decode = use_flash_attention_decode();
+        const size_t block_size = k_total->size(2);
+
+        // Debug helper: confirm which attention implementation is selected at runtime.
+        // We guard it to avoid spamming logs across TP ranks and layers.
+        if (env_bool("INFINILM_DEBUG_ATTN_DISPATCH") && rank_info_.tp_rank == 0 && layer_idx_ == 0) {
+            static std::atomic<bool> printed{false};
+            if (!printed.exchange(true)) {
+                fprintf(stderr,
+                        "[INFINILM][llama_attention] decode dispatch: want_flash_decode=%d block_size=%zu heads=%zu kv_heads=%zu head_dim=%zu tp_rank=%d tp_size=%d\n",
+                        static_cast<int>(want_flash_decode), block_size,
+                        static_cast<size_t>(num_attention_heads_), static_cast<size_t>(num_key_value_heads_),
+                        static_cast<size_t>(head_dim_), rank_info_.tp_rank, rank_info_.tp_size);
+            }
+        }
+
+        if (want_flash_decode && (block_size % 256 == 0)) {
+            infinicore::op::flash_attention_(
+                attn_output,
+                q_reshaped,
+                k_total,
+                v_total,
+                block_tables.value(),
+                total_sequence_lengths.value(),
+                std::nullopt,
+                scaling_);
+        } else {
+            if (want_flash_decode && (block_size % 256 != 0)) {
+                spdlog::warn("flash_attention decode requires paged block_size % 256 == 0, got {}. Falling back to paged_attention_.", block_size);
+            }
+            infinicore::op::paged_attention_(
+                attn_output,
+                q_reshaped,
+                k_total,
+                v_total,
+                block_tables.value(),
+                total_sequence_lengths.value(),
+                std::nullopt,
+                scaling_);
+        }
     }
 
     // 7. Project output

@@ -258,7 +258,7 @@ class GenerationMixin:
             f" Batchsize={batch_size}  Per_Batch_Input_Len={seq_len}  Per_Batch_New_Tokens={len(time_list)}\n"
         )
         print(
-            f" Prefill TTFT: {round(time_list[0], 2)}ms  Throughput: {round((batch_size * seq_len) / time_list[0], 2)}tok/s\n",
+            f" Prefill TTFT: {round(time_list[0] * 1000, 2)}ms  Throughput: {round((batch_size * seq_len) / time_list[0], 2)}tok/s\n",
         )
         if len(time_list) > 1:
             print(

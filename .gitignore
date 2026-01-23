@@ -30,5 +30,7 @@ __pycache__/
 
 *.http
 
+*.so
+
 # codex
 test/codex_coding/

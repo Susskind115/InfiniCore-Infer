@@ -88,6 +88,30 @@ def get_args():
         action="store_true",
         help="use paged cache",
     )
+    parser.add_argument(
+        "--paged-block-size",
+        type=int,
+        default=256,
+        help="paged kv cache block size",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="sampling temperature (top_k=1 approximates greedy/argmax)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=50,
+        help="top-k sampling (set to 1 for greedy/argmax)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="top-p (nucleus) sampling",
+    )
 
     return parser.parse_args()
 
@@ -99,6 +123,10 @@ def test(
     infini_device=infinicore.device("cpu", 0),
     tp=1,
     enable_paged_attn=False,
+    paged_block_size=256,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.95,
 ):
     model_path = os.path.expanduser(model_path)
     # ---------------------------------------------------------------------------- #
@@ -164,7 +192,8 @@ def test(
         batch_size = 1 if prompts is str else len(prompts)
         max_total_tokens = max_new_tokens + len(input_ids_list[0])
         cache_config = PagedKVCacheConfig(
-            num_blocks=(max_total_tokens // 16 + 1) * batch_size, block_size=16
+            num_blocks=(max_total_tokens // paged_block_size + 1) * batch_size,
+            block_size=paged_block_size,
         )
     else:
         batch_size = 1 if prompts is str else len(prompts)
@@ -186,9 +215,13 @@ def test(
     output_ids = model.generate(
         input_ids_infini,
         GenerationConfig(
-            max_new_tokens=max_new_tokens, temperature=1, top_k=1, top_p=0.8
+            max_new_tokens=max_new_tokens,
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
         ),
         _measure_and_log_time=True,
+        paged_block_size=paged_block_size,
     )
     t2 = time.time()
 
@@ -231,6 +264,10 @@ if __name__ == "__main__":
     backend = args.backend
     tp = args.tp
     enable_paged_attn = args.enable_paged_attn
+    paged_block_size = args.paged_block_size
+    temperature = args.temperature
+    top_k = args.top_k
+    top_p = args.top_p
     if backend != "cpp":
         raise ValueError(f"Unsupported backend: {backend}.")
 
@@ -243,4 +280,8 @@ if __name__ == "__main__":
         infini_device=infini_device,
         tp=tp,
         enable_paged_attn=enable_paged_attn,
+        paged_block_size=paged_block_size,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
     )
